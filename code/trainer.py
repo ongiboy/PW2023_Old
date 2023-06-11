@@ -32,11 +32,15 @@ def Trainer(model,  temporal_contr_model, model_optimizer, temp_cont_optimizer, 
     """Pretraining"""
     if training_mode == 'pre_train':
         print('Pretraining on source dataset')
+
+        pretrain_loss = []
+
         for epoch in range(1, config.num_epoch + 1):
             # Train and validate
             """Train. In fine-tuning, this part is also trained???"""
             train_loss, train_acc, train_auc = model_pretrain(model, temporal_contr_model, model_optimizer, temp_cont_optimizer, criterion,
                                                               train_dl, config, device, training_mode, model_F=model_F, model_F_optimizer=model_F_optimizer)
+            pretrain_loss.append(train_loss)
 
             if training_mode != 'self_supervised':  # use scheduler in all other modes.
                 scheduler.step(train_loss)
@@ -48,12 +52,17 @@ def Trainer(model,  temporal_contr_model, model_optimizer, temp_cont_optimizer, 
         chkpoint = {'model_state_dict': model.state_dict(),}
         torch.save(chkpoint, os.path.join(experiment_log_dir, "saved_models", f'ckp_last.pt'))
         print('Pretrained model is stored at folder:{}'.format(experiment_log_dir+'saved_models'+'ckp_last.pt'))
+        logger.debug('Pretraining loss: %s', pretrain_loss)
 
     """Fine-tuning and Test"""
     if training_mode != 'pre_train':  # no need to run the evaluation for self-supervised mode.
         """fine-tune"""
         print('Fine-tune  on Fine-tuning set')
         performance_list = []
+        finetune_loss = []
+        finetune_acc = []
+        test_loss_list = []
+        test_acc_list = []
         total_f1 = []
         for epoch in range(1, config.num_epoch + 1):
             valid_loss, valid_acc, valid_auc, valid_prc, emb_finetune, label_finetune, F1 = model_finetune(model, temporal_contr_model, valid_dl, config, device, training_mode,
@@ -66,52 +75,65 @@ def Trainer(model,  temporal_contr_model, model_optimizer, temp_cont_optimizer, 
                          f'finetune Loss  : {valid_loss:.4f}\t | \tfinetune Accuracy : {valid_acc:2.4f}\t | '
                          f'\tfinetune AUC : {valid_auc:2.4f} \t |finetune PRC: {valid_prc:0.4f} ')
 
-            # # save best fine-tuning model""
-            # global arch
-            # arch = 'sleepedf2eplipsy'
-            # if len(total_f1) == 0 or F1 > max(total_f1):
-            #     print('update fine-tuned model')
-            #     os.makedirs('experiments_logs/finetunemodel/', exist_ok=True)
-            #     torch.save(model.state_dict(), 'experiments_logs/finetunemodel/' + arch + '_model.pt')
-            #     torch.save(classifier.state_dict(), 'experiments_logs/finetunemodel/' + arch + '_classifier.pt')
-            # total_f1.append(F1)
+            # save best fine-tuning model""
+            global arch
+            arch = 'sleepedf2eplipsy'
+            if len(total_f1) == 0 or F1 > max(total_f1):
+                print('update fine-tuned model')
+                os.makedirs('experiments_logs/finetunemodel/', exist_ok=True)
+                torch.save(model.state_dict(), 'experiments_logs/finetunemodel/' + arch + '_model.pt')
+                torch.save(classifier.state_dict(), 'experiments_logs/finetunemodel/' + arch + '_classifier.pt')
+            total_f1.append(F1)
 
 
             # evaluate on the test set
             """Testing set"""
             logger.debug('\nTest on Target datasts test set')
-            # model.load_state_dict(torch.load('experiments_logs/finetunemodel/' + arch + '_model.pt'))
-            # classifier.load_state_dict(torch.load('experiments_logs/finetunemodel/' + arch + '_classifier.pt'))
+            model.load_state_dict(torch.load('experiments_logs/finetunemodel/' + arch + '_model.pt'))
+            classifier.load_state_dict(torch.load('experiments_logs/finetunemodel/' + arch + '_classifier.pt'))
             test_loss, test_acc, test_auc, test_prc, emb_test, label_test, performance = model_test(model, temporal_contr_model, test_dl, config, device, training_mode,
                                                                 model_F=model_F, model_F_optimizer=model_F_optimizer,
                                                              classifier=classifier, classifier_optimizer=classifier_optimizer)
-
+            
+            finetune_loss.append(valid_loss)
+            finetune_acc.append(valid_acc)
+            test_acc_list.append(test_acc)
+            test_loss_list.append(test_loss)
             performance_list.append(performance)
+
         performance_array = np.array(performance_list)
         best_performance = performance_array[np.argmax(performance_array[:,0], axis=0)]
-        print('Best Testing: Acc=%.4f| Precision = %.4f | Recall = %.4f | F1 = %.4f | AUROC= %.4f | PRC=%.4f'
+        logger.debug("\n################## Best test performance #########################")
+        logger.debug('Best Testing: Acc=%.4f| Precision = %.4f | Recall = %.4f | F1 = %.4f | AUROC= %.4f | PRC=%.4f'
               % (best_performance[0], best_performance[1], best_performance[2], best_performance[3], best_performance[4], best_performance[5]))
 
+        logger.debug("\n################## Saved fine-tune accuracies and losses #########################")
+        logger.debug("\n Finetune_Accuracies= %s", finetune_acc)
+        logger.debug("\n Finetune_Losses= %s", finetune_loss)
+        logger.debug("\n Test_Accuracies= %s", test_acc_list)
+        logger.debug("\n Test_Losses= %s", test_loss_list)
+
+
         # train classifier: KNN
-        neigh = KNeighborsClassifier(n_neighbors=1)
-        neigh.fit(emb_finetune.detach().cpu().numpy(), label_finetune)
-        knn_acc_train = neigh.score(emb_finetune.detach().cpu().numpy(), label_finetune)
-        print('KNN finetune acc:', knn_acc_train)
-        # test the downstream classifier
-        representation_test = emb_test.detach().cpu().numpy()
-        knn_result = neigh.predict(representation_test)
-        knn_result_score = neigh.predict_proba(representation_test)
-        one_hot_label_test = one_hot_encoding(label_test)
-        print(classification_report(label_test, knn_result, digits=4))
-        print(confusion_matrix(label_test, knn_result))
-        knn_acc = accuracy_score(label_test, knn_result)
-        precision = precision_score(label_test, knn_result, average='macro', )
-        recall = recall_score(label_test, knn_result, average='macro', )
-        F1 = f1_score(label_test, knn_result, average='macro')
-        auc = roc_auc_score(knn_result_score, one_hot_label_test, average="macro", multi_class="ovr")
-        prc = average_precision_score(knn_result_score, one_hot_label_test, average="macro")
-        print("KNN Train Acc:{}. '\n' Test: acc {}, precision {}, Recall {}, F1 {}, AUROC {}, AUPRC {}"
-              "".format(knn_acc_train, knn_acc, precision, recall, F1, auc, prc))
+        # neigh = KNeighborsClassifier(n_neighbors=1)
+        # neigh.fit(emb_finetune.detach().cpu().numpy(), label_finetune)
+        # knn_acc_train = neigh.score(emb_finetune.detach().cpu().numpy(), label_finetune)
+        # print('KNN finetune acc:', knn_acc_train)
+        # # test the downstream classifier
+        # representation_test = emb_test.detach().cpu().numpy()
+        # knn_result = neigh.predict(representation_test)
+        # knn_result_score = neigh.predict_proba(representation_test)
+        # one_hot_label_test = one_hot_encoding(label_test)
+        # print(classification_report(label_test, knn_result, digits=4))
+        # print(confusion_matrix(label_test, knn_result))
+        # knn_acc = accuracy_score(label_test, knn_result)
+        # precision = precision_score(label_test, knn_result, average='macro', )
+        # recall = recall_score(label_test, knn_result, average='macro', )
+        # F1 = f1_score(label_test, knn_result, average='macro')
+        # auc = roc_auc_score(knn_result_score, one_hot_label_test, average="macro", multi_class="ovr")
+        # prc = average_precision_score(knn_result_score, one_hot_label_test, average="macro")
+        # print("KNN Train Acc:{}. '\n' Test: acc {}, precision {}, Recall {}, F1 {}, AUROC {}, AUPRC {}"
+        #       "".format(knn_acc_train, knn_acc, precision, recall, F1, auc, prc))
 
     logger.debug("\n################## Training is Done! #########################")
 
